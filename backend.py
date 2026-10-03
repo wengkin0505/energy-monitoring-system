@@ -35,7 +35,7 @@
 from __future__ import annotations
 import argparse, json, re, warnings, os, sys
 from dataclasses import dataclass, asdict, field
-from datetime import date
+from datetime import date, datetime
 from itertools import product
 from pathlib import Path
 
@@ -286,72 +286,81 @@ def _declared_pv_kwp(path: Path) -> "float | None":
     return None
 
 
-def load_universal(path: str) -> tuple[pd.DataFrame, dict]:
-    """Universal loader: handles all 4 RExharge file formats + generic CSV/XLSX."""
-    path = Path(path)
-    print(f"\nLoading {path.name} ...")
-    is_csv = path.suffix.lower() == ".csv"
+LOAD_COL_NAMES = ("load_kw", "load", "kw", "demand_kw", "demand", "power_kw", "power")
 
-    # Auto-detect header row
-    probe = (pd.read_csv(path, header=None, nrows=5) if is_csv
-             else pd.read_excel(path, header=None, nrows=5))
-    header = None
-    for i, row in probe.iterrows():
-        joined = " ".join(str(c).lower() for c in row.values if pd.notna(c))
-        if any(k in joined for k in ("date","kw import","end time","timestamp")):
-            header = i; break
 
-    df = (pd.read_csv(path, header=header) if is_csv
-          else pd.read_excel(path, header=header))
-    if header is None:
-        # Headerless TNB export — name columns by position
+def _looks_like_time(v) -> bool:
+    if isinstance(v, (pd.Timestamp, datetime, np.datetime64)):
+        return True
+    if isinstance(v, str) and re.search(r"\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}", v):
+        return not pd.isna(pd.to_datetime(v, errors="coerce"))
+    return False
+
+
+def _read_sheet(raw: pd.DataFrame) -> "pd.DataFrame | None":
+    """Header = the row just above the first row that starts with a date."""
+    first = next((i for i in range(min(15, len(raw))) if _looks_like_time(raw.iat[i, 0])), None)
+    if first is None:
+        return None                                   # e.g. a notes sheet
+    df = raw.iloc[first:].reset_index(drop=True)
+    if first == 0:                                    # headerless TNB export
         defaults = {6:["start_time","end_time","kw_export","kw_import","kvar_export","kvar_import"],
                     5:["end_time","kw_export","kw_import","kvar_export","kvar_import"],
                     4:["end_time","kw_export","kw_import","kvar_import"]}
         df.columns = defaults.get(df.shape[1], [f"c{i}" for i in range(df.shape[1])])
+    else:
+        df.columns = [str(c) for c in raw.iloc[first - 1]]
+    df.columns = [re.sub(r"[\s/]+", "_", c.strip().lower()) for c in df.columns]
+    cols = list(df.columns)
 
-    df.columns = [str(c).strip().lower().replace(" ","_").replace("/","_") for c in df.columns]
+    ts_i = next((cols.index(c) for c in ("start_time","timestamp","datetime","end_time") if c in cols), 0)
+    # ALL import / export columns -> supports several meters in one file
+    imp_i = [i for i, c in enumerate(cols) if "import" in c and "kvar" not in c]
+    exp_i = [i for i, c in enumerate(cols) if "export" in c and "kvar" not in c]
+    if not imp_i:
+        imp_i = [i for i, c in enumerate(cols) if c in LOAD_COL_NAMES][:1]
+    if not imp_i:
+        raise ValueError(f"No load column found. Columns are: {cols}. Expected 'kW Import' "
+                         f"or one of {LOAD_COL_NAMES}.")
 
-    ts_col  = next((c for c in ("start_time","timestamp","datetime","end_time","date") if c in df.columns), df.columns[0])
-    imp_col = next((c for c in df.columns if "import" in c and "kvar" not in c), None)
-    if imp_col is None:
-        imp_col = next((c for c in ("load_kw","kw_import","kw") if c in df.columns), None)
-    if imp_col is None:
-        raise ValueError(f"No import/load column in {path.name}")
-    exp_col = next((c for c in df.columns if "export" in c and "kvar" not in c), None)
+    num = lambda idx: df.iloc[:, idx].apply(pd.to_numeric, errors="coerce")
+    ts = pd.to_datetime(df.iloc[:, ts_i], errors="coerce")
+    if "end" in cols[ts_i]:
+        ts = ts - pd.Timedelta(hours=INTERVAL_H)
+    # skipna=False: if any meter has a gap ("-"), drop that row and interpolate later
+    return pd.DataFrame({
+        "timestamp": ts,
+        "kw_import": num(imp_i).clip(lower=0).sum(axis=1, skipna=False),
+        "kw_export": num(exp_i).clip(lower=0).sum(axis=1, skipna=False) if exp_i else 0.0,
+    }).dropna()
 
-    df[ts_col]  = pd.to_datetime(df[ts_col],  errors="coerce")
-    df[imp_col] = pd.to_numeric(df[imp_col],  errors="coerce")
-    if exp_col: df[exp_col] = pd.to_numeric(df[exp_col], errors="coerce")
-    df = df.dropna(subset=[ts_col, imp_col])
-    # TNB meters stamp each reading with the interval END time (e.g. "Date /
-    # End Time"). Shift to interval START so 13:30-14:00 counts as off-peak
-    # and 21:30-22:00 as peak, matching the RP4 14:00-22:00 window.
-    if "end" in ts_col:
-        df[ts_col] = df[ts_col] - pd.Timedelta(hours=INTERVAL_H)
 
-    out = pd.DataFrame({
-        "timestamp": df[ts_col],
-        "kw_import": df[imp_col].clip(lower=0),
-        "kw_export": df[exp_col].clip(lower=0) if exp_col else 0.0,
-    }).sort_values("timestamp").reset_index(drop=True)
+def load_universal(path: str) -> tuple[pd.DataFrame, dict]:
+    """Universal loader: TNB exports (single/multi meter, multi-sheet) + generic CSV/XLSX."""
+    path = Path(path)
+    print(f"\nLoading {path.name} ...")
+    if path.suffix.lower() == ".csv":
+        sheets = {"csv": pd.read_csv(path, header=None)}
+    else:
+        sheets = pd.read_excel(path, header=None, sheet_name=None)   # every sheet
+
+    parts = [p for p in (_read_sheet(s) for s in sheets.values() if not s.empty) if p is not None]
+    if not parts:
+        raise ValueError(f"No timestamped data found in {path.name}")
+    out = (pd.concat(parts).sort_values("timestamp")
+             .drop_duplicates("timestamp").reset_index(drop=True))
     out["load_kw"] = out["kw_import"] - out["kw_export"]
-
-    # Ensure 30-min uniform spacing
     out = (out.set_index("timestamp").resample("30min").mean()
               .interpolate().reset_index())
 
     declared_pv = _declared_pv_kwp(path)
     meta = {
-        "name": path.stem,
-        "n_intervals": len(out),
-        "start_ts": str(out["timestamp"].min()),
-        "end_ts":   str(out["timestamp"].max()),
-        "max_load_kw":  float(out["load_kw"].max()),
-        "mean_load_kw": float(out["load_kw"].mean()),
-        "p95_load_kw":  float(np.percentile(out["load_kw"], 95)),
-        "load_factor":  float(out["load_kw"].mean()/max(out["load_kw"].max(),1e-6)),
-        "has_solar":    bool(declared_pv) or (out["kw_export"].abs().sum() > 1.0),
+        "name": path.stem, "n_intervals": len(out),
+        "start_ts": str(out["timestamp"].min()), "end_ts": str(out["timestamp"].max()),
+        "max_load_kw": float(out["load_kw"].max()), "mean_load_kw": float(out["load_kw"].mean()),
+        "p95_load_kw": float(np.percentile(out["load_kw"], 95)),
+        "load_factor": float(out["load_kw"].mean()/max(out["load_kw"].max(),1e-6)),
+        "has_solar": bool(declared_pv) or (out["kw_export"].abs().sum() > 1.0),
         "declared_pv_kwp": declared_pv,
     }
     print(f"  → {meta['n_intervals']:,} intervals  peak={meta['max_load_kw']:.0f} kW  "
